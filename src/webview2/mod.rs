@@ -7,7 +7,6 @@ mod util;
 
 use std::{
   borrow::Cow, cell::RefCell, collections::HashSet, fmt::Write, fs, path::PathBuf, rc::Rc,
-  sync::mpsc,
 };
 
 use dpi::{PhysicalPosition, PhysicalSize};
@@ -21,7 +20,11 @@ use windows::{
     Foundation::*,
     Globalization::*,
     Graphics::Gdi::*,
-    System::{Com::*, LibraryLoader::GetModuleHandleW},
+    System::{
+      Com::*,
+      LibraryLoader::GetModuleHandleW,
+      Threading::{CreateEventW, SetEvent, INFINITE},
+    },
     UI::{Input::KeyboardAndMouse::SetFocus, Shell::*, WindowsAndMessaging::*},
   },
 };
@@ -51,6 +54,26 @@ impl From<windows::core::Error> for Error {
   fn from(err: windows::core::Error) -> Self {
     Error::WebView2Error(webview2_com::Error::WindowsError(err))
   }
+}
+
+/// Wait for an async WebView2 operation to complete on an STA thread.
+///
+/// Uses [`CoWaitForMultipleHandles`] with `COWAIT_DISPATCH_CALLS | COWAIT_DISPATCH_WINDOW_MESSAGES`
+/// — the COM-sanctioned way to block on an STA thread. A nested Win32 message pump
+/// (`webview2_com::wait_with_pump`) does NOT let COM re-enter the apartment, so the async
+/// completion callback is never delivered on Windows ARM64 → permanent deadlock (white screen).
+/// See tauri-apps/wry#1665. This primitive dispatches COM calls + window messages so the
+/// completion handler runs on the calling thread on every architecture.
+fn co_wait_for_handle(event: HANDLE) -> windows::core::Result<()> {
+  unsafe {
+    CoWaitForMultipleHandles(
+      (COWAIT_DISPATCH_CALLS.0 | COWAIT_DISPATCH_WINDOW_MESSAGES.0) as u32,
+      INFINITE,
+      &[event],
+    )?;
+    CloseHandle(event)?;
+  }
+  Ok(())
 }
 
 pub(crate) struct InnerWebView {
@@ -327,7 +350,13 @@ impl InnerWebView {
       arguments
     });
 
-    let (tx, rx) = mpsc::channel();
+    // CoWaitForMultipleHandles instead of mpsc::channel + wait_with_pump (ARM64 deadlock, see
+    // co_wait_for_handle). The completion callback runs on this STA thread, so a single-threaded
+    // Rc<RefCell> holds the result; HANDLE is passed as isize to keep the closure non-Send-safe.
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
+    let result: Rc<RefCell<Option<Result<ICoreWebView2Environment>>>> = Rc::new(RefCell::new(None));
+    let result_clone = result.clone();
+    let event_handle = event.0 as isize;
     let options = CoreWebView2EnvironmentOptions::default();
     unsafe {
       options.set_additional_browser_arguments(additional_browser_args);
@@ -350,23 +379,22 @@ impl InnerWebView {
         PCWSTR::null(),
         &data_directory.unwrap_or_default(),
         &ICoreWebView2EnvironmentOptions::from(options),
-        // we don't use CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async
-        // as it uses an mspc::channel under the hood, so we can avoid using two channels
-        // by manually creating the callback handler and use webview2_com::with_with_bump
         &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
           move |error_code, environment| {
-            let result = (|| {
+            *result_clone.borrow_mut() = Some((|| {
               error_code?;
               environment.ok_or_else(|| windows::core::Error::from(E_POINTER).into())
-            })();
-            tx.send(result)
-              .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+            })());
+            SetEvent(HANDLE(event_handle as *mut _)).ok();
+            Ok(())
           },
         )),
       )?;
     }
 
-    webview2_com::wait_with_pump(rx)?
+    co_wait_for_handle(event)?;
+    let outcome = result.borrow_mut().take();
+    outcome.unwrap_or_else(|| Err(windows::core::Error::from(E_UNEXPECTED).into()))
   }
 
   #[inline]
@@ -377,19 +405,20 @@ impl InnerWebView {
     background_color: Option<(u8, u8, u8, u8)>,
     profile_name: Option<&str>,
   ) -> Result<ICoreWebView2Controller> {
-    let (tx, rx) = mpsc::channel();
+    // CoWaitForMultipleHandles instead of mpsc::channel + wait_with_pump (ARM64 deadlock).
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
+    let result: Rc<RefCell<Option<Result<ICoreWebView2Controller>>>> = Rc::new(RefCell::new(None));
+    let result_clone = result.clone();
+    let event_handle = event.0 as isize;
 
-    // we don't use CreateCoreWebView2ControllerCompletedHandler::wait_for_async
-    // as it uses an mspc::channel under the hood, so we can avoid using two channels
-    // by manually creating the callback handler and use webview2_com::with_with_bump
     let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
       move |error_code, controller| {
-        let result = (|| {
+        *result_clone.borrow_mut() = Some((|| {
           error_code?;
           controller.ok_or_else(|| windows::core::Error::from(E_POINTER).into())
-        })();
-        tx.send(result)
-          .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+        })());
+        unsafe { SetEvent(HANDLE(event_handle as *mut _)).ok() };
+        Ok(())
       },
     ));
 
@@ -423,7 +452,9 @@ impl InnerWebView {
       }
     }
 
-    webview2_com::wait_with_pump(rx)?
+    co_wait_for_handle(event)?;
+    let outcome = result.borrow_mut().take();
+    outcome.unwrap_or_else(|| Err(windows::core::Error::from(E_UNEXPECTED).into()))
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -1694,17 +1725,19 @@ impl InnerWebView {
   }
 
   fn cookies_inner(&self, uri: PCWSTR) -> Result<Vec<cookie::Cookie<'static>>> {
-    let (tx, rx) = mpsc::channel();
+    // CoWaitForMultipleHandles instead of mpsc::channel + wait_with_pump (ARM64 deadlock).
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
+    let result: Rc<RefCell<Option<Result<Vec<cookie::Cookie<'static>>>>>> =
+      Rc::new(RefCell::new(None));
+    let result_clone = result.clone();
+    let event_handle = event.0 as isize;
 
     let webview = self.webview.cast::<ICoreWebView2_2>()?;
     unsafe {
       webview.CookieManager()?.GetCookies(
         uri,
-        // we don't use GetCookiesCompletedHandler::wait_for_async
-        // as it uses an mspc::channel under the hood, so we can avoid using two channels
-        // by manually creating the callback handler and use webview2_com::with_with_bump
         &GetCookiesCompletedHandler::create(Box::new(move |error_code, cookies| {
-          let result = (move || {
+          *result_clone.borrow_mut() = Some((move || {
             error_code?;
 
             let cookies = if let Some(cookies) = cookies {
@@ -1726,15 +1759,16 @@ impl InnerWebView {
               Vec::new()
             };
             Ok(cookies)
-          })();
-
-          tx.send(result)
-            .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+          })());
+          SetEvent(HANDLE(event_handle as *mut _)).ok();
+          Ok(())
         })),
       )?;
     }
 
-    webview2_com::wait_with_pump(rx)?
+    co_wait_for_handle(event)?;
+    let outcome = result.borrow_mut().take();
+    outcome.unwrap_or_else(|| Err(windows::core::Error::from(E_UNEXPECTED).into()))
   }
 
   pub fn set_cookie(&self, cookie: &cookie::Cookie<'_>) -> Result<()> {
